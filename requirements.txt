@@ -1,0 +1,2 @@
+fastapi[standard]==0.112.2
+python-can==4.2.2
