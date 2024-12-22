@@ -8,9 +8,15 @@ from dataclasses import dataclass
 from functools import wraps
 from typing import Annotated, Any, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Path
+from fastapi import Depends, FastAPI, HTTPException, Path, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from opentrons.hardware_control.types import StatusBarState
-from opentrons.protocol_engine.state import TemperatureModuleId, ThermocyclerModuleId
+from opentrons.protocol_engine.state.module_substates import (
+    TemperatureModuleId,
+    ThermocyclerModuleId,
+)
+from opentrons.protocol_engine.types import ModuleModel
 
 from app_requests import (
     InstructionRequest,
@@ -64,61 +70,63 @@ async def create_state() -> AppState:
 app = FastAPI()
 
 
-@app.get("/robot/status")
-async def robot_status(
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    exc_str = f"{exc}".replace("\n", " ").replace("   ", " ")
+    logging.error(f"{request}: {exc_str}")
+    content = {"status_code": 10422, "message": exc_str, "data": None}
+    return JSONResponse(content=content, status_code=status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
+@app.get("/status")
+def robot_status(
     state: Annotated[AppState, Depends(create_state)],
 ):
+    response = {
+        "robot": {},
+    }
     run = state.executing
-    response = {}
     if run:
         robot = run.robot
-        temperature = run.deck["C1"].module
-        if temperature:
-            hardware = robot.equipment.get_module_hardware_api(
-                cast(TemperatureModuleId, temperature.moduleId)
-            )
-        else:
-            hardware = None
-        if hardware:
-            response["C1"] = {
-                "module": {
-                    "kind": "temperature",
-                    "temperature": hardware.temperature,
-                    "target": hardware.target,
+        response["run"] = {
+            "id": run.id,
+            "state": "failed" if run.failed else "running" if run.active else "success",
+        }
+        for bay, slot in run.deck.items():
+            if not slot.module:
+                continue
+
+            module = slot.module
+            if module.model == ModuleModel.TEMPERATURE_MODULE_V2:
+                hardware = robot.equipment.get_module_hardware_api(
+                    cast(TemperatureModuleId, module.location.moduleId)
+                )
+                if not hardware:
+                    continue
+                response["robot"][bay] = {
+                    "module": {
+                        "kind": "temperature",
+                        "temperature": hardware.temperature,
+                        "target": hardware.target,
+                    }
                 }
-            }
-
-            # print(
-            #    state.robot.state_store.modules.get_temperature_module_substate(
-            #        temperature.moduleId
-            #    )
-            # )
-
-        thermocycler = run.deck["B1"].module
-        if thermocycler:
-            hardware = robot.equipment.get_module_hardware_api(
-                cast(ThermocyclerModuleId, thermocycler.moduleId)
-            )
-        else:
-            hardware = None
-        if hardware:
-            response["B1"] = {
-                "module": {
-                    "kind": "thermocycler",
-                    "block_status": hardware.status,
-                    "block_target": hardware.target,
-                    "block_temp": hardware.temperature,
-                    "lid_status": hardware.lid_status,
-                    "lid_target": hardware.lid_target,
-                    "lid_temp": hardware.lid_temp,
+            elif module.model == ModuleModel.THERMOCYCLER_MODULE_V2:
+                hardware = robot.equipment.get_module_hardware_api(
+                    cast(ThermocyclerModuleId, module.location.moduleId)
+                )
+                if not hardware:
+                    continue
+                response["robot"][bay] = {
+                    "module": {
+                        "kind": "thermocycler",
+                        "block_status": hardware.status,
+                        "block_target": hardware.target,
+                        "block_temp": hardware.temperature,
+                        "lid_status": hardware.lid_status,
+                        "lid_target": hardware.lid_target,
+                        "lid_temp": hardware.lid_temp,
+                    }
                 }
-            }
-
-            # print(
-            #    state.robot.state_store.modules.get_thermocycler_module_substate(
-            #        thermocycler.moduleId
-            #    )
-            # )
 
     return response
 
@@ -222,7 +230,7 @@ def run_stream_status(
 
 
 async def close_run(run: Run, state: AppState, *, force: bool):
-    run.closed = False
+    run.closed = True
 
     for stream in run.streams.values():
         if not force:
@@ -234,8 +242,26 @@ async def close_run(run: Run, state: AppState, *, force: bool):
         del stream.queue[:]
         stream.active = False
 
-    await deactivate_robot(run, success=not run.failed)
-    run.active = False
+    if force:
+        # Give the robot some time to settle
+        await asyncio.sleep(5)
+
+    logging.warning("Deactivating robot")
+    deactivated = False
+    for i in range(3):
+        try:
+            await deactivate_robot(run, success=not run.failed)
+            deactivated = True
+            break
+        except:
+            logging.exception(f"Failed to deactivate (attempt {i + 1})")
+            await asyncio.sleep(1)
+
+    if deactivated:
+        logging.warning("Deactivated successfully, clearing the run")
+        run.active = False
+    else:
+        logging.error("Failed to deactivate, not clearing the run")
 
 
 def get_run(run_id: str, state: AppState) -> Run:
@@ -266,20 +292,6 @@ def get_instruction(instruction_id: str, stream: Stream) -> Instruction:
         return instruction
     else:
         raise HTTPException(404, "No such instruction")
-
-
-async def queue_instruction(instruction: Instruction, run: Run):
-    await instruction.execution_barrier.acquire()
-    try:
-        instruction.state = ExecutionState.EXECUTING
-        logging.info("Executing instruction: %s", json.dumps(instruction.raw))
-        await execute_instruction(instruction.raw, run)
-        instruction.state = ExecutionState.SUCCEEDED
-    except:
-        instruction.state = ExecutionState.FAILED
-        raise
-    finally:
-        instruction.execution_barrier.release()
 
 
 async def run_worker(run: Run, state: AppState):

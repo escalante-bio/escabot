@@ -29,7 +29,7 @@ from opentrons.protocol_engine.execution.equipment import LoadedLabwareData
 from opentrons.protocol_engine.execution.rail_lights import RailLightsHandler
 from opentrons.protocol_engine.execution.status_bar import StatusBarHandler
 from opentrons.protocol_engine.execution.tip_handler import TipHandler
-from opentrons.protocol_engine.state import StateStore
+from opentrons.protocol_engine.state.state import StateStore
 
 from app_requests import InstructionRequest
 
@@ -76,28 +76,27 @@ class Robot:
 
 
 @dataclass(frozen=True, kw_only=True)
+class RobotDeckModule:
+    model: str
+    location: ModuleLocation
+
+
+@dataclass(kw_only=True)
 class RobotDeckSlot:
 
     @staticmethod
     def create(location: AddressableAreaLocation | DeckSlotLocation) -> RobotDeckSlot:
         return RobotDeckSlot(
-            location=location, lock=asyncio.Lock(), module_lock=asyncio.Lock(), stack=[location]
+            location=location,
+            lock=asyncio.Lock(),
+            module=None,
+            stack=[location],
         )
 
     location: AddressableAreaLocation | DeckSlotLocation
     lock: asyncio.Lock
-    module_lock: asyncio.Lock
+    module: RobotDeckModule | None
     stack: list[AddressableAreaLocation | DeckSlotLocation | ModuleLocation | OnLabwareLocation]
-
-    @property
-    def module(self) -> ModuleLocation | None:
-        if len(self.stack) < 2:
-            return None
-        bottom = self.stack[1]
-        if isinstance(bottom, ModuleLocation):
-            return bottom
-        else:
-            return None
 
     def is_on_deck(self):
         return isinstance(self.location, DeckSlotLocation)
@@ -118,9 +117,9 @@ class RobotHardware:
 @dataclass(kw_only=True)
 class RobotPipette:
     pipette: LoadPipetteResult
+    channels: int
     has_tip: bool
     max_volume_nl: float
-    unused_tips: list[RobotTip]
 
 
 @dataclass(frozen=True, kw_only=True)

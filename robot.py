@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+import types
 from typing import Literal, Optional, cast
 
 from fastapi import HTTPException
@@ -8,8 +9,10 @@ from opentrons.types import DeckSlotName, Mount, MountType
 from opentrons.hardware_control import API as HardwareAPI, HardwareControlAPI
 from opentrons.hardware_control.ot3api import OT3API
 from opentrons.hardware_control.types import DoorState, HardwareFeatureFlags, StatusBarState
+from opentrons.protocol_api.core.labware import LabwareLoadParams
 from opentrons.protocol_engine import (
     AddressableOffsetVector,
+    AllNozzleLayoutConfiguration,
     Command,
     CommandCreate,
     CommandIntent,
@@ -17,28 +20,40 @@ from opentrons.protocol_engine import (
     Config,
     DeckType,
     DropTipWellLocation,
+    SingleNozzleLayoutConfiguration,
 )
 from opentrons.protocol_engine.actions import (
     ActionDispatcher,
     AddAddressableAreaAction,
+    AddLabwareDefinitionAction,
     QueueCommandAction,
     RunCommandAction,
-    # SetDeckConfigurationAction,
+    SetDeckConfigurationAction,
     SucceedCommandAction,
 )
 from opentrons.protocol_engine.commands import (
     AspirateCreate,
     AspirateParams,
     AspirateResult,
+    CommandDefinedErrorData,
+    ConfigureNozzleLayoutCreate,
+    ConfigureNozzleLayoutParams,
+    ConfigureNozzleLayoutResult,
     DispenseCreate,
     DispenseParams,
     DispenseResult,
+    DropTipCreate,
+    DropTipParams,
+    DropTipResult,
     DropTipInPlaceCreate,
     DropTipInPlaceParams,
     DropTipInPlaceResult,
     HomeCreate,
     HomeParams,
     HomeResult,
+    LiquidProbeCreate,
+    LiquidProbeParams,
+    LiquidProbeResult,
     LoadLabwareCreate,
     LoadLabwareParams,
     LoadLabwareResult,
@@ -51,9 +66,15 @@ from opentrons.protocol_engine.commands import (
     MoveLabwareCreate,
     MoveLabwareParams,
     MoveLabwareResult,
+    MoveRelativeCreate,
+    MoveRelativeParams,
+    MoveRelativeResult,
     MoveToAddressableAreaForDropTipCreate,
     MoveToAddressableAreaForDropTipParams,
     MoveToAddressableAreaForDropTipResult,
+    MoveToWellCreate,
+    MoveToWellParams,
+    MoveToWellResult,
     PickUpTipCreate,
     PickUpTipParams,
     PickUpTipResult,
@@ -99,7 +120,6 @@ from opentrons.protocol_engine.error_recovery_policy import (
     ErrorRecoveryPolicy,
     ErrorRecoveryType,
 )
-from opentrons.protocol_engine import WellLocation, WellOrigin, WellOffset
 from opentrons.protocol_engine.execution import (
     CommandExecutor,
     EquipmentHandler,
@@ -115,8 +135,19 @@ from opentrons.protocol_engine.execution.pipetting import create_pipetting_handl
 from opentrons.protocol_engine.execution.rail_lights import RailLightsHandler
 from opentrons.protocol_engine.execution.status_bar import StatusBarHandler
 from opentrons.protocol_engine.execution.tip_handler import TipHandler, create_tip_handler
-from opentrons.protocol_engine.resources import DeckDataProvider, ModelUtils, ModuleDataProvider
-from opentrons.protocol_engine.state import CommandEntry, StateStore
+from opentrons.protocol_engine.resources import (
+    DeckDataProvider,
+    FileProvider,
+    ModelUtils,
+    ModuleDataProvider,
+)
+from opentrons.protocol_engine.state.command_history import CommandEntry
+from opentrons.protocol_engine.state.state import StateStore
+from opentrons.protocol_engine import (
+    WellLocation,
+    WellOffset,
+    WellOrigin,
+)
 from opentrons.protocol_engine.types import (
     AddressableAreaLocation,
     DeckSlotLocation,
@@ -125,42 +156,60 @@ from opentrons.protocol_engine.types import (
     LabwareOffsetVector,
     ModuleLocation,
     ModuleModel,
+    MovementAxis,
     OnLabwareLocation,
-    WellLocation,
-    WellOrigin,
+    LiquidHandlingWellLocation,
 )
 from opentrons.protocols.api_support.deck_type import (
     guess_from_global_config as guess_deck_type_from_global_config,
 )
 from opentrons.protocols.api_support.definitions import MAX_SUPPORTED_VERSION
 from opentrons.protocols.api_support.util import find_value_for_api_version
+from opentrons.protocols.models import LabwareDefinition
 from opentrons.util import entrypoint_util
-from opentrons_shared_data.pipette.dev_types import PipetteNameType
-
-# from opentrons_shared_data.pipette.types import PipetteNameType
+from opentrons_shared_data.labware.types import LabwareUri
+from opentrons_shared_data.pipette.types import PipetteNameType
 from opentrons_shared_data.robot import load as load_robot
 
 from app_requests import (
+    AddLabwareDefinitionRequest,
+    AspirateRequest,
+    DispenseRequest,
     DropTipRequest,
+    HomeRequest,
     InitializeRequest,
     InstructionRequest,
-    LoadPlateRequest,
-    MovePlateRequest,
-    PipetteRequest,
-    TemperatureBlockRequest,
-    ThermocyclerBlockRequest,
-    ThermocyclerLidRequest,
+    LoadModuleRequest,
+    LoadLabwareRequest,
+    MoveLabwareRequest,
+    MoveToWellRequest,
+    PickUpTipRequest,
+    TemperatureBlockTemperatureRequest,
+    ThermocycleBlockTemperatureRequest,
+    ThermocycleLidHingeRequest,
+    ThermocycleLidTemperatureRequest,
+    WaitRequest,
 )
-from app_types import Robot, RobotDeckSlot, RobotHardware, RobotPipette, RobotTip, Run
+from app_types import (
+    Robot,
+    RobotDeckModule,
+    RobotDeckSlot,
+    RobotHardware,
+    RobotPipette,
+    Run,
+)
 
 
-# See the defaults at
-# https://github.com/Opentrons/opentrons/blob/aadc65ec79ebbf66acd9df08dcfb7910d34cdfb9/api/src/opentrons/protocol_api/instrument_context.py#L44
-ASPIRATE_DISPENSE_LOCATION = WellLocation(origin=WellOrigin.BOTTOM, offset=WellOffset(z=1))
 # See the mapping at
 # https://github.com/Opentrons/opentrons/blob/aadc65ec79ebbf66acd9df08dcfb7910d34cdfb9/api/src/opentrons/protocol_api/validation.py#L63
 PIPETTE_1_CHANNEL = PipetteNameType.P50_SINGLE_FLEX
-WASTE_CHUTE_AREA = "1ChannelWasteChute"
+PIPETTE_8_CHANNEL = PipetteNameType.P50_MULTI_FLEX
+WASTE_CHUTE_AREA = "96ChannelWasteChute"  # originally was 1Channel. Was that important?
+
+# See the default pipetting offset at
+# https://github.com/Opentrons/opentrons/blob/aadc65ec79ebbf66acd9df08dcfb7910d34cdfb9/api/src/opentrons/protocol_api/instrument_context.py#L44
+LABWARE_OFFSETS = {
+}
 
 
 async def create_hardware_control(simulate_hardware: bool) -> HardwareControlAPI:
@@ -168,6 +217,7 @@ async def create_hardware_control(simulate_hardware: bool) -> HardwareControlAPI
         return await HardwareAPI.build_hardware_simulator(
             attached_instruments={
                 Mount.LEFT: {"id": "p1", "model": "p50_single_v3.6"},
+                Mount.RIGHT: {"id": "p8", "model": "p50_multi_v3.5"},
             },
             feature_flags=HardwareFeatureFlags.build_from_ff(),
         )
@@ -182,14 +232,10 @@ async def create_hardware_control(simulate_hardware: bool) -> HardwareControlAPI
 
 
 def create_error_recovery_policy() -> ErrorRecoveryPolicy:
-    # def _policy(
-    #    config: Config,
-    #    failed_command: Command,
-    #    defined_error_data: Optional[CommandDefinedErrorData],
-    # ) -> ErrorRecoveryType:
     def _policy(
+        config: Config,
         failed_command: Command,
-        exception: Exception,
+        defined_error_data: Optional[CommandDefinedErrorData],
     ) -> ErrorRecoveryType:
         return ErrorRecoveryType.FAIL_RUN
 
@@ -200,10 +246,9 @@ async def create_state_store(hardware_api: HardwareControlAPI, config: Config) -
     deck_data = DeckDataProvider(config.deck_type)
     deck_definition = await deck_data.get_deck_definition()
     deck_fixed_labware = await deck_data.get_deck_fixed_labware(
-        # TODO(april): not released yet
-        # load_fixed_trash=False,
+        load_fixed_trash=False,
         deck_definition=deck_definition,
-        # deck_configuration=None,
+        deck_configuration=None,
     )
 
     module_calibration_offsets = ModuleDataProvider.load_module_calibrations()
@@ -212,11 +257,9 @@ async def create_state_store(hardware_api: HardwareControlAPI, config: Config) -
         config=config,
         deck_definition=deck_definition,
         deck_fixed_labware=deck_fixed_labware,
-        # TODO(april): not released yet
-        # robot_definition=robot_definition,
+        robot_definition=robot_definition,
         is_door_open=hardware_api.door_state is DoorState.OPEN,
-        # TODO(april): not released yet
-        # error_recovery_policy=create_error_recovery_policy(),
+        error_recovery_policy=create_error_recovery_policy(),
         module_calibration_offsets=module_calibration_offsets,
         deck_configuration=None,
         notify_publishers=None,
@@ -262,7 +305,11 @@ async def create_state_store(hardware_api: HardwareControlAPI, config: Config) -
 
     def set_command_failed_concurrent(command: Command) -> None:
         prev_entry = command_history.get(command.id)
-        assert prev_entry.command.status == CommandStatus.RUNNING
+        assert prev_entry.command.status in (
+            CommandStatus.RUNNING,
+            CommandStatus.SUCCEEDED,
+            CommandStatus.FAILED,
+        )
         assert command.status == CommandStatus.FAILED
         command_history._add(
             command.id,
@@ -295,13 +342,12 @@ async def create_opentrons_state(hardware: RobotHardware) -> Robot:
         # We deliberately omit ignore_pause=True because, in the current implementation of
         # opentrons.protocol_api.core.engine, that would incorrectly make
         # ProtocolContext.is_simulating() return True.
-        # TODO(april): yikes! See https://github.com/Opentrons/opentrons/commit/b1b8361e279abe7e69c009c3749ec0bfd30a9bb4
-        use_simulated_deck_config=True,
-        # This seems expected
+        use_simulated_deck_config=hardware.simulate_hardware,
         use_virtual_pipettes=hardware.simulate_hardware,
         use_virtual_gripper=hardware.simulate_hardware,
         use_virtual_modules=hardware.simulate_hardware,
     )
+    file_provider = FileProvider()
     state_store = await create_state_store(hardware.hardware_api, config)
 
     action_dispatcher = ActionDispatcher(sink=state_store)
@@ -355,8 +401,8 @@ async def create_opentrons_state(hardware: RobotHardware) -> Robot:
             action_dispatcher=action_dispatcher,
             hardware_api=hardware.hardware_api,
             equipment=equipment,
-            error_recovery_policy=create_error_recovery_policy(),
             movement=movement,
+            file_provider=file_provider,
             gantry_mover=gantry_mover,
             labware_movement=labware_movement,
             pipetting=pipetting,
@@ -382,13 +428,15 @@ async def create_opentrons_state(hardware: RobotHardware) -> Robot:
 async def initialize_robot(run: Run):
     robot = run.robot
     await set_status_bar(StatusBarState.RUNNING, robot)
-    # TODO(april): not released yet
-    # robot.action_dispatcher.dispatch(
-    #     SetDeckConfigurationAction(entrypoint_util.get_deck_configuration())
-    # )
+    await asyncio.get_running_loop().run_in_executor(None, lambda: (
+        robot.action_dispatcher.dispatch(
+            SetDeckConfigurationAction(entrypoint_util.get_deck_configuration())
+        )
+    ))
     await home(run, robot)
     await load_waste_chute(run, robot)
-    await load_pipette(PIPETTE_1_CHANNEL, 50000, MountType.LEFT, run, robot)
+    await load_pipette(PIPETTE_1_CHANNEL, 1, 50000, MountType.LEFT, run, robot)
+    await load_pipette(PIPETTE_8_CHANNEL, 8, 50000, MountType.RIGHT, run, robot)
 
 
 async def execute_instruction(instruction: InstructionRequest, run: Run):
@@ -405,36 +453,101 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
         # We don't need to lock here because run.initialized basically is a lock
 
         await initialize_robot(run)
-        for temperature in instruction.temperatures:
-            await load_module(ModuleModel.TEMPERATURE_MODULE_V2, temperature.bay, run, robot)
-            # TODO(april): XXX bring this back when Opentrons fixes their garbage
-            # await load_labware("opentrons_96_well_aluminum_block", temperature.bay, run, robot)
-        for thermocycler in instruction.thermocyclers:
-            await load_module(ModuleModel.THERMOCYCLER_MODULE_V2, thermocycler.bay, run, robot)
-            await set_thermocycler_lid(
-                at_slot=run.deck[thermocycler.bay],
-                closed=False,
-                temperature_c=50,
-                run=run,
-                robot=robot,
-            )
         for tip_rack in instruction.tip_racks:
-            loaded = await load_labware("opentrons_flex_96_tiprack_50ul", "C3", run, robot)
-            run.pipettes[PIPETTE_1_CHANNEL].unused_tips.extend(
-                map(lambda s: RobotTip(labware=loaded, well=s), make_spaces(rows=8, cols=12))
-            )
+            await load_labware("opentrons/opentrons_flex_96_tiprack_50ul/1", tip_rack, run, robot)
 
         run.initialized = True
         return
     elif not run.initialized:
         raise Exception(f"Run {run.id} hasn't been initialized yet")
 
-    if isinstance(instruction, DropTipRequest):
+    if isinstance(instruction, AddLabwareDefinitionRequest):
+        add_labware_definition(instruction.definition, robot)
+    elif isinstance(instruction, DropTipRequest):
         await run.gantry_lock.acquire()
-        await drop_tip(run, robot, validate=False)
+        try:
+            pipette = await get_pipette(instruction.channels, run, robot)
+            if instruction.well:
+                slot = run.deck[instruction.well.bay]
+                well = instruction.well.well
+                if not slot:
+                    raise HTTPException(400, f"Bay {instruction.well.bay} is invalid")
+            else:
+                slot = None
+                well = None
+            await drop_tip(slot, well, pipette, robot, validate=False)
+        finally:
+            run.gantry_lock.release()
+    elif isinstance(instruction, AspirateRequest):
+        volume_nl = instruction.volume_nl
+        if not volume_nl:
+            raise HTTPException(400, f"volume_nl is {volume_nl}")
+
+        bay = instruction.at.bay
+        slot = run.deck.get(bay)
+        if not slot:
+            raise HTTPException(400, f"Bay {bay} is invalid")
+        await slot.lock.acquire()
+
+        if not slot.top_is_plate():
+            raise HTTPException(400, f"Bay {bay} doesn't have a plate on top")
+
+        await run.gantry_lock.acquire()
+        pipette = await get_pipette(instruction.channels, run, robot)
+        if volume_nl > pipette.max_volume_nl:
+            raise HTTPException(
+                400,
+                (
+                    f"Requested volume {volume_nl}nl exceeds pipette's limit of "
+                    f"{pipette.max_volume_nl}nl"
+                ),
+            )
+
+        await aspirate(
+            slot,
+            instruction.at.well,
+            volume_nl,
+            instruction.z_mm,
+            pipette,
+            run,
+            robot,
+        )
+
         run.gantry_lock.release()
-    elif isinstance(instruction, LoadPlateRequest):
-        bay = instruction.into.bay
+        slot.lock.release()
+    elif isinstance(instruction, DispenseRequest):
+        volume_nl = instruction.volume_nl
+        if not volume_nl:
+            raise HTTPException(400, f"volume_nl is {volume_nl}")
+
+        bay = instruction.at.bay
+        slot = run.deck.get(bay)
+        if not slot:
+            raise HTTPException(400, f"Bay {bay} is invalid")
+        await slot.lock.acquire()
+
+        if not slot.top_is_plate():
+            raise HTTPException(400, f"Bay {bay} doesn't have a plate on top")
+
+        await run.gantry_lock.acquire()
+        pipette = await get_pipette(instruction.channels, run, robot)
+        if volume_nl > pipette.max_volume_nl:
+            raise HTTPException(
+                400,
+                (
+                    f"Requested volume {volume_nl}nl exceeds pipette's limit of "
+                    f"{pipette.max_volume_nl}nl"
+                ),
+            )
+        await dispense(slot, instruction.at.well, volume_nl, instruction.z_mm, pipette, run, robot)
+        run.gantry_lock.release()
+        slot.lock.release()
+    elif isinstance(instruction, HomeRequest):
+        await run.gantry_lock.acquire()
+        await home(run, robot)
+        run.gantry_lock.release()
+    elif isinstance(instruction, LoadLabwareRequest):
+        bay = instruction.into
         existing = run.deck[bay]
         if not existing:
             raise HTTPException(400, f"Bay {bay} is invalid")
@@ -443,15 +556,28 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
         # Whatever.
         # if existing.top_is_plate():
         #    raise HTTPException(409, f"Bay {bay} already contains something")
-
         await load_labware(instruction.model, bay, run, robot)
         existing.lock.release()
-    elif isinstance(instruction, MovePlateRequest):
-        from_bay = instruction.from_.bay
+    elif isinstance(instruction, LoadModuleRequest):
+        bay = instruction.into
+        existing = run.deck[bay]
+        if not existing:
+            raise HTTPException(400, f"Bay {bay} is invalid")
+        await existing.lock.acquire()
+
+        if instruction.module == "magnetic":
+            await load_module(ModuleModel.MAGNETIC_BLOCK_V1, instruction.into, run, robot)
+        elif instruction.module == "temperature":
+            await load_module(ModuleModel.TEMPERATURE_MODULE_V2, instruction.into, run, robot)
+        elif instruction.module == "thermocycling":
+            await load_module(ModuleModel.THERMOCYCLER_MODULE_V2, instruction.into, run, robot)
+        existing.lock.release()
+    elif isinstance(instruction, MoveLabwareRequest):
+        from_bay = instruction.from_
         from_slot = run.deck[from_bay]
         if not from_slot:
             raise HTTPException(400, f"Bay {from_bay} is invalid")
-        to_bay = instruction.to.bay
+        to_bay = instruction.to
         to_slot = run.deck[to_bay]
         if not to_slot:
             raise HTTPException(400, f"Bay {to_bay} is invalid")
@@ -462,77 +588,59 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
 
         if not from_slot.top_is_plate():
             raise HTTPException(409, f"Bay {from_bay} doesn't have a plate on top")
-        if to_slot.top_is_plate():
-            raise HTTPException(409, f"Bay {to_bay} already has a plate on top")
+        # This is hard to check because we place lids on top of plates
+        # Whatever.
+        # if to_slot.top_is_plate():
+        #     raise HTTPException(409, f"Bay {to_bay} already has a plate on top")
 
         await run.gantry_lock.acquire()
         await move_labware(from_slot, to_slot, run, robot)
         run.gantry_lock.release()
         for lock in reversed(deck_locks):
             lock.release()
-    elif isinstance(instruction, PipetteRequest):
-        volume_nl = instruction.volume_nl
-        if not volume_nl:
-            raise HTTPException(400, f"volume_nl is {volume_nl}")
-
-        from_bay = instruction.from_.plate.bay
-        from_slot = run.deck[from_bay]
-        if not from_slot:
-            raise HTTPException(400, f"Bay {from_bay} is invalid")
-        to_bay = instruction.to.plate.bay
+    elif isinstance(instruction, MoveToWellRequest):
+        to_bay = instruction.to.bay
         to_slot = run.deck[to_bay]
         if not to_slot:
             raise HTTPException(400, f"Bay {to_bay} is invalid")
 
-        deck_locks = order_locks([from_bay, to_bay], run)
-        for lock in deck_locks:
-            await lock.acquire()
-
-        if not from_slot.top_is_plate():
-            raise HTTPException(400, f"Bay {from_bay} doesn't have a plate on top")
-        if not to_slot.top_is_plate():
-            raise HTTPException(400, f"Bay {to_bay} doesn't have a plate on top")
+        await to_slot.lock.acquire()
+        if to_slot.top_is_plate():
+            raise HTTPException(409, f"Bay {to_bay} already has a plate on top")
 
         await run.gantry_lock.acquire()
-        pipette = run.pipettes[PIPETTE_1_CHANNEL]
-        remaining = volume_nl
-        while remaining > 0:
-            await pick_up_tip(run, robot)
-            await aspirate(
-                from_slot,
-                instruction.from_.well,
-                min(remaining, pipette.max_volume_nl),
-                pipette,
-                run,
-                robot,
-            )
-            await dispense(
-                to_slot,
-                instruction.to.well,
-                min(remaining, pipette.max_volume_nl),
-                pipette,
-                run,
-                robot,
-            )
-            await drop_tip(run, robot)
-            remaining -= pipette.max_volume_nl
+        pipette = await get_pipette(instruction.channels, run, robot)
+        await move_to_well(
+            to_slot,
+            instruction.to.well,
+            pipette,
+            robot,
+            WellLocation(origin=WellOrigin.BOTTOM, offset=instruction.offset),
+        )
         run.gantry_lock.release()
-        for lock in reversed(deck_locks):
-            lock.release()
-    elif isinstance(instruction, TemperatureBlockRequest):
-        at_bay = instruction.at.bay
+        to_slot.lock.release()
+    elif isinstance(instruction, PickUpTipRequest):
+        await run.gantry_lock.acquire()
+        pipette = await get_pipette(instruction.channels, run, robot)
+        slot = run.deck[instruction.well.bay]
+        if not slot:
+            raise HTTPException(400, f"Bay {instruction.well.bay} is invalid")
+        await pick_up_tip(slot, instruction.well.well, pipette, robot)
+        run.gantry_lock.release()
+    elif isinstance(instruction, TemperatureBlockTemperatureRequest):
+        at_bay = instruction.at
         at_slot = run.deck[at_bay]
         if not at_slot:
             raise HTTPException(400, f"Bay {at_bay} is invalid")
         await at_slot.lock.acquire()
         await set_temperature_block(at_slot, instruction.temperature_c, run, robot)
         at_slot.lock.release()
-    elif isinstance(instruction, ThermocyclerBlockRequest):
-        at_bay = instruction.at.bay
+    elif isinstance(instruction, ThermocycleBlockTemperatureRequest):
+        at_bay = instruction.at
         at_slot = run.deck[at_bay]
         if not at_slot:
             raise HTTPException(400, f"Bay {at_bay} is invalid")
-        await at_slot.module_lock.acquire()
+        await at_slot.lock.acquire()
         await set_thermocycler_block(
             at_slot=at_slot,
             duration_us=instruction.duration_us,
@@ -541,45 +649,83 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
             run=run,
             robot=robot,
         )
-        at_slot.module_lock.release()
-    elif isinstance(instruction, ThermocyclerLidRequest):
-        at_bay = instruction.at.bay
+        at_slot.lock.release()
+    elif isinstance(instruction, ThermocycleLidHingeRequest):
+        at_bay = instruction.at
         at_slot = run.deck[at_bay]
         if not at_slot:
             raise HTTPException(400, f"Bay {at_bay} is invalid")
-
-        await at_slot.module_lock.acquire()
-        if instruction.closed:
-            await at_slot.lock.acquire()
-
+        await at_slot.lock.acquire()
         await run.gantry_lock.acquire()
-        await set_thermocycler_lid(
+        await set_thermocycler_lid_hinge(
             at_slot=at_slot,
             closed=instruction.closed,
-            temperature_c=instruction.temperature_c,
             run=run,
             robot=robot,
         )
         run.gantry_lock.release()
+        at_slot.lock.release()
+    elif isinstance(instruction, ThermocycleLidTemperatureRequest):
+        at_bay = instruction.at
+        at_slot = run.deck[at_bay]
+        if not at_slot:
+            raise HTTPException(400, f"Bay {at_bay} is invalid")
 
-        # It's possible the lid was already open and we got a request to open it, so we need to
-        # check if we actually took the lock.
-        if not instruction.closed and at_slot.lock.locked():
-            at_slot.lock.release()
-        at_slot.module_lock.release()
+        await at_slot.lock.acquire()
+        await set_thermocycler_lid_temperature(
+            at_slot=at_slot,
+            temperature_c=instruction.temperature_c,
+            run=run,
+            robot=robot,
+        )
+        at_slot.lock.release()
+    elif isinstance(instruction, WaitRequest):
+        await asyncio.sleep(instruction.duration_us / 1000 / 1000)
     else:
         raise HTTPException(400, f"Unknown command: {instruction}")
     logging.warning("Finished executing instruction %s", instruction)
+
+
+async def get_pipette(
+    channels: int,
+    run: Run,
+    robot: Robot,
+) -> RobotPipette:
+    pipette = run.pipettes[PIPETTE_1_CHANNEL if channels <= 1 else PIPETTE_8_CHANNEL]
+    if pipette.channels == channels:
+        return pipette
+
+    request = ConfigureNozzleLayoutCreate(
+        params=ConfigureNozzleLayoutParams(
+            pipetteId=pipette.pipette.pipetteId,
+            configurationParams=(
+                AllNozzleLayoutConfiguration()
+                if channels in [1, 8]
+                else SingleNozzleLayoutConfiguration(primaryNozzle="A1")
+            ),
+        ),
+        intent=CommandIntent.PROTOCOL,
+        key=None,
+    )
+    cast(ConfigureNozzleLayoutResult, await execute(request, robot))
+    pipette.channels = channels
+    return pipette
+
+
+def add_labware_definition(definition: dict, robot: Robot) -> None:
+    robot.state_store.handle_action(
+        AddLabwareDefinitionAction(definition=LabwareDefinition.parse_obj(definition)))
 
 
 async def aspirate(
     slot: RobotDeckSlot,
     well: str,
     volume_nl: int | float,
+    z: float,
     pipette: RobotPipette,
     run: Run,
     robot: Robot,
-) -> AspirateResult:
+) -> MoveRelativeResult:
     if not pipette.has_tip:
         raise HTTPException(409, f"Pipette {PIPETTE_1_CHANNEL} doesn't have a tip")
     pipetteId = pipette.pipette.pipetteId
@@ -589,13 +735,21 @@ async def aspirate(
         # We can still try to move the temperature adapter... oops
         raise Exception(f"Expected labware to be on top")
 
-    request = AspirateCreate(
+    if isinstance(slot.location, DeckSlotLocation):
+        offset = LABWARE_OFFSETS.get(slot.location.slotName.value) or WellOffset()
+    else:
+        offset = WellOffset()
+    wellLocation = LiquidHandlingWellLocation(
+        origin=WellOrigin.BOTTOM,
+        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z),
+    )
+    aspirate = AspirateCreate(
         params=AspirateParams(
             labwareId=top.labwareId,
             pipetteId=pipetteId,
             volume=volume_nl / 1000,
             wellName=well,
-            wellLocation=ASPIRATE_DISPENSE_LOCATION,
+            wellLocation=wellLocation,
             flowRate=find_value_for_api_version(
                 MAX_SUPPORTED_VERSION,
                 robot.state_store.pipettes.get_flow_rates(pipetteId).default_aspirate,
@@ -604,8 +758,20 @@ async def aspirate(
         intent=CommandIntent.PROTOCOL,
         key=None,
     )
-    result = cast(AspirateResult, await execute(request, robot))
-    return result
+    cast(AspirateResult, await execute(aspirate, robot))
+
+    # If we offset the aspirate and dispense to handle stupid OT bugs then OT may calculate that
+    # it's clear of the well incorrectly and drag the pipette tip through wells. So just go up more.
+    move = MoveRelativeCreate(
+        params=MoveRelativeParams(
+            pipetteId=pipetteId,
+            axis=MovementAxis.Z,
+            distance=20,
+        ),
+        intent=CommandIntent.PROTOCOL,
+        key=None,
+    )
+    return cast(MoveRelativeResult, await execute(move, robot))
 
 
 async def home(run: Run, robot: Robot) -> HomeResult:
@@ -621,10 +787,11 @@ async def dispense(
     slot: RobotDeckSlot,
     well: str,
     volume_nl: int | float,
+    z: float,
     pipette: RobotPipette,
     run: Run,
     robot: Robot,
-) -> DispenseResult:
+) -> None:
     if not pipette.has_tip:
         raise HTTPException(409, f"Pipette {PIPETTE_1_CHANNEL} doesn't have a tip")
     pipetteId = pipette.pipette.pipetteId
@@ -634,13 +801,21 @@ async def dispense(
         # We can still try to move the temperature adapter... oops
         raise Exception(f"Expected labware to be on top")
 
-    request = DispenseCreate(
+    if isinstance(slot.location, DeckSlotLocation):
+        offset = LABWARE_OFFSETS.get(slot.location.slotName.value, WellOffset())
+    else:
+        offset = WellOffset()
+    well_location = LiquidHandlingWellLocation(
+        origin=WellOrigin.BOTTOM,
+        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z),
+    )
+    dispense = DispenseCreate(
         params=DispenseParams(
             labwareId=top.labwareId,
             pipetteId=pipetteId,
             volume=volume_nl / 1000,
             wellName=well,
-            wellLocation=ASPIRATE_DISPENSE_LOCATION,
+            wellLocation=well_location,
             pushOut=None,
             flowRate=find_value_for_api_version(
                 MAX_SUPPORTED_VERSION,
@@ -650,54 +825,135 @@ async def dispense(
         intent=CommandIntent.PROTOCOL,
         key=None,
     )
-    result = cast(DispenseResult, await execute(request, robot))
-    return result
+    cast(DispenseResult, await execute(dispense, robot))
 
-
-async def drop_tip(run: Run, robot: Robot, *, validate=True) -> DropTipInPlaceResult:
-    pipette = run.pipettes[PIPETTE_1_CHANNEL]
-    if validate and not pipette.has_tip:
-        raise HTTPException(409, f"Pipette {PIPETTE_1_CHANNEL} doesn't have a tip")
-
-    move = MoveToAddressableAreaForDropTipCreate(
-        params=MoveToAddressableAreaForDropTipParams(
-            addressableAreaName=WASTE_CHUTE_AREA,
-            pipetteId=pipette.pipette.pipetteId,
-            alternateDropLocation=None,
+    move_to_well = MoveToWellCreate(
+        params=MoveToWellParams(
+            labwareId=top.labwareId,
+            pipetteId=pipetteId,
+            wellName=well,
+            wellLocation=WellLocation(
+                origin=well_location.origin,
+                offset=WellOffset(
+                    x=well_location.offset.x,
+                    y=well_location.offset.y,
+                    z=well_location.offset.z + 50,
+                ),
+            ),
             forceDirect=False,
-            ignoreTipConfiguration=None,
             minimumZHeight=None,
-            # Some bug in OT software means we need to set this to 20
-            offset=AddressableOffsetVector(x=0, y=0, z=20),
             speed=None,
         ),
         intent=CommandIntent.PROTOCOL,
         key=None,
     )
-    await execute(move, robot)
+    cast(MoveToWellResult, await execute(move_to_well, robot))
 
-    drop = DropTipInPlaceCreate(
-        params=DropTipInPlaceParams(
+
+async def drop_tip(
+    slot: RobotDeckSlot | None,
+    well: str | None,
+    pipette: RobotPipette,
+    robot: Robot,
+    *,
+    validate=True,
+) -> None:
+    if validate and not pipette.has_tip:
+        raise HTTPException(409, f"Pipette {PIPETTE_1_CHANNEL} doesn't have a tip")
+
+    if slot and well:
+        top = slot.stack[-1]
+        if not isinstance(top, OnLabwareLocation):
+            # We can still try to move the temperature adapter... oops
+            raise Exception(f"Expected labware to be on top")
+
+        drop = DropTipCreate(
+            params=DropTipParams(
+                labwareId=top.labwareId,
+                wellName=well,
+                # Set this high enough that it hopefully doesn't pick up other tips while dropping
+                # these
+                wellLocation=DropTipWellLocation(offset=WellOffset(z=20)),
+                alternateDropLocation=True,
+                pipetteId=pipette.pipette.pipetteId,
+                homeAfter=None,
+            ),
+            intent=CommandIntent.PROTOCOL,
+            key=None,
+        )
+        cast(DropTipResult, await execute(drop, robot))
+    else:
+        move = MoveToAddressableAreaForDropTipCreate(
+            params=MoveToAddressableAreaForDropTipParams(
+                addressableAreaName=WASTE_CHUTE_AREA,
+                pipetteId=pipette.pipette.pipetteId,
+                alternateDropLocation=None,
+                forceDirect=False,
+                ignoreTipConfiguration=None,
+                minimumZHeight=None,
+                # Some bug in OT software means we need to set this to 20
+                offset=AddressableOffsetVector(x=0, y=0, z=20),
+                speed=None,
+            ),
+            intent=CommandIntent.PROTOCOL,
+            key=None,
+        )
+        await execute(move, robot)
+
+        drop = DropTipInPlaceCreate(
+            params=DropTipInPlaceParams(
+                pipetteId=pipette.pipette.pipetteId,
+                homeAfter=None,
+            ),
+            intent=CommandIntent.PROTOCOL,
+            key=None,
+        )
+        cast(DropTipInPlaceResult, await execute(drop, robot))
+
+    pipette.has_tip = False
+
+
+async def liquid_probe(
+    slot: RobotDeckSlot,
+    well: str,
+    pipette: RobotPipette,
+    run: Run,
+    robot: Robot,
+) -> LiquidProbeResult:
+    top = slot.stack[-1]
+    if not isinstance(top, OnLabwareLocation):
+        # We can still try to move the temperature adapter... oops
+        raise Exception(f"Expected labware to be on top")
+
+    if isinstance(slot.location, DeckSlotLocation):
+        offset = LABWARE_OFFSETS.get(slot.location.slotName.value) or WellOffset()
+    else:
+        offset = WellOffset()
+    request = LiquidProbeCreate(
+        params=LiquidProbeParams(
             pipetteId=pipette.pipette.pipetteId,
-            homeAfter=None,
+            labwareId=top.labwareId,
+            wellName=well,
+            wellLocation=WellLocation(
+                origin=WellOrigin.TOP,
+                offset=WellOffset(x=offset.x, y=offset.y, z=0),
+            ),
         ),
         intent=CommandIntent.PROTOCOL,
         key=None,
     )
-    result = cast(DropTipInPlaceResult, await execute(drop, robot))
-
-    pipette.has_tip = False
-    return result
+    return cast(LiquidProbeResult, await execute(request, robot))
 
 
 async def load_labware(model: str, location: str, run: Run, robot: Robot) -> OnLabwareLocation:
     actual = run.deck[location].stack[-1]
+    details = LabwareLoadParams.from_uri(cast(LabwareUri, model))
     request = LoadLabwareCreate(
         params=LoadLabwareParams(
             location=actual,
-            loadName=model,
-            namespace="opentrons",
-            version=1,
+            loadName=details.load_name,
+            namespace=details.namespace,
+            version=details.version,
             labwareId=None,
             displayName=None,
         ),
@@ -723,12 +979,16 @@ async def load_module(
         key=None,
     )
     result = cast(LoadModuleResult, await execute(request, robot))
-    run.deck[location].stack.append(ModuleLocation(moduleId=result.moduleId))
+    module_location = ModuleLocation(moduleId=result.moduleId)
+    slot = run.deck[location]
+    slot.module = RobotDeckModule(model=model, location=module_location)
+    slot.stack.append(module_location)
     return result
 
 
 async def load_pipette(
     pipette_name: PipetteNameType,
+    channels: int,
     max_volume_nl: float,
     mount: MountType,
     run: Run,
@@ -740,8 +1000,7 @@ async def load_pipette(
             mount=mount,
             pipetteId=None,
             tipOverlapNotAfterVersion=None,
-            # TODO(april): not ready yet
-            # liquidPresenceDetection=None,
+            liquidPresenceDetection=None,
         ),
         intent=CommandIntent.PROTOCOL,
         key=None,
@@ -749,9 +1008,9 @@ async def load_pipette(
     result = cast(LoadPipetteResult, await execute(request, robot))
     run.pipettes[pipette_name] = RobotPipette(
         pipette=result,
+        channels=channels,
         has_tip=False,
         max_volume_nl=max_volume_nl,
-        unused_tips=[],
     )
     return result
 
@@ -765,20 +1024,46 @@ async def load_waste_chute(run: Run, robot: Robot) -> None:
 
 
 async def move_labware(
-    before: RobotDeckSlot, after: RobotDeckSlot, run: Run, robot: Robot
+    before: RobotDeckSlot,
+    after: RobotDeckSlot,
+    run: Run,
+    robot: Robot,
+    *,
+    pickUpOffset: LabwareOffsetVector | None = None,
+    dropOffset: LabwareOffsetVector | None = None,
 ) -> MoveLabwareResult:
     was = before.stack[-1]
     if not isinstance(was, OnLabwareLocation):
-        # We can still try to move the temperature adapter... oops
+        # This doesn't stop us from trying to move the temperature adapter... oops
         raise Exception(f"Expected labware to be on top")
+
+    if pickUpOffset:
+        pass
+    elif isinstance(before.location, AddressableAreaLocation):
+        if before.location.addressableAreaName in ('A4', 'B4', 'C4', 'D4'):
+            pickUpOffset = LabwareOffsetVector(x=0, y=0, z=5)
+        else:
+            pickUpOffset = LabwareOffsetVector(x=0, y=0, z=0)
+    else:
+        pickUpOffset = LabwareOffsetVector(x=0, y=0, z=0)
+
+    if dropOffset:
+        pass
+    elif isinstance(after.location, AddressableAreaLocation):
+        if after.location.addressableAreaName in ('A4', 'B4', 'C4', 'D4'):
+            dropOffset = LabwareOffsetVector(x=0, y=0, z=5)
+        else:
+            dropOffset = LabwareOffsetVector(x=0, y=0, z=0)
+    else:
+        dropOffset = LabwareOffsetVector(x=0, y=0, z=0)
 
     request = MoveLabwareCreate(
         params=MoveLabwareParams(
             labwareId=was.labwareId,
             newLocation=after.stack[-1],
             strategy=LabwareMovementStrategy.USING_GRIPPER,
-            pickUpOffset=None,
-            dropOffset=None,
+            pickUpOffset=pickUpOffset,
+            dropOffset=dropOffset,
         ),
         intent=CommandIntent.PROTOCOL,
         key=None,
@@ -788,16 +1073,51 @@ async def move_labware(
     return result
 
 
-async def pick_up_tip(run: Run, robot: Robot) -> PickUpTipResult:
-    pipette = run.pipettes[PIPETTE_1_CHANNEL]
+async def move_to_well(
+    slot: RobotDeckSlot,
+    well: str,
+    pipette: RobotPipette,
+    robot: Robot,
+    wellLocation: WellLocation,
+) -> MoveToWellResult:
+    pipetteId = pipette.pipette.pipetteId
+
+    top = slot.stack[-1]
+    if not isinstance(top, OnLabwareLocation):
+        # We can still try to move the temperature adapter... oops
+        raise Exception(f"Expected labware to be on top")
+
+    request = MoveToWellCreate(
+        params=MoveToWellParams(
+            labwareId=top.labwareId,
+            pipetteId=pipetteId,
+            wellName=well,
+            wellLocation=wellLocation,
+            forceDirect=False,
+            minimumZHeight=None,
+            speed=None,
+        ),
+        intent=CommandIntent.PROTOCOL,
+        key=None,
+    )
+    result = cast(MoveToWellResult, await execute(request, robot))
+    return result
+
+
+async def pick_up_tip(
+    slot: RobotDeckSlot, well: str, pipette: RobotPipette, robot: Robot
+) -> PickUpTipResult:
     if pipette.has_tip:
         raise HTTPException(409, f"Pipette {PIPETTE_1_CHANNEL} already has a tip")
 
-    tip = pipette.unused_tips.pop()
+    top = slot.stack[-1]
+    if not isinstance(top, OnLabwareLocation):
+        # We can still try to move the temperature adapter... oops
+        raise Exception(f"Expected labware to be on top")
     request = PickUpTipCreate(
         params=PickUpTipParams(
-            labwareId=tip.labware.labwareId,
-            wellName=tip.well,
+            labwareId=top.labwareId,
+            wellName=well,
             pipetteId=pipette.pipette.pipetteId,
         ),
         intent=CommandIntent.PROTOCOL,
@@ -821,7 +1141,7 @@ async def set_temperature_block(
 
     request = SetTargetTemperatureCreate(
         params=SetTargetTemperatureParams(
-            moduleId=module.moduleId,
+            moduleId=module.location.moduleId,
             celsius=float(temperature_c),
         ),
         intent=CommandIntent.PROTOCOL,
@@ -831,7 +1151,7 @@ async def set_temperature_block(
 
     request = WaitForTemperatureCreate(
         params=WaitForTemperatureParams(
-            moduleId=module.moduleId,
+            moduleId=module.location.moduleId,
             celsius=None,
         ),
         intent=CommandIntent.PROTOCOL,
@@ -855,7 +1175,7 @@ async def set_thermocycler_block(
 
     request = SetTargetBlockTemperatureCreate(
         params=SetTargetBlockTemperatureParams(
-            moduleId=module.moduleId,
+            moduleId=module.location.moduleId,
             celsius=float(temperature_c),
             blockMaxVolumeUl=float(max_volume_nl / 1000),
             holdTimeSeconds=float(duration_us / 1000_000) if duration_us else None,
@@ -867,7 +1187,7 @@ async def set_thermocycler_block(
 
     request = WaitForBlockTemperatureCreate(
         params=WaitForBlockTemperatureParams(
-            moduleId=module.moduleId,
+            moduleId=module.location.moduleId,
         ),
         intent=CommandIntent.PROTOCOL,
         key=None,
@@ -875,24 +1195,38 @@ async def set_thermocycler_block(
     return cast(WaitForBlockTemperatureResult, await execute(request, robot))
 
 
-async def set_thermocycler_lid(
-    *, at_slot: RobotDeckSlot, closed: bool, temperature_c: int | float, run: Run, robot: Robot
-) -> WaitForLidTemperatureResult:
+async def set_thermocycler_lid_hinge(
+    *, at_slot: RobotDeckSlot, closed: bool, run: Run, robot: Robot
+) -> None:
     module = at_slot.module
     if not module:
         raise HTTPException(400, f"Bay {at_slot.location} doesn't have a module")
 
     if closed:
         request = CloseLidCreate(
-            params=CloseLidParams(moduleId=module.moduleId),
+            params=CloseLidParams(moduleId=module.location.moduleId),
             intent=CommandIntent.PROTOCOL,
             key=None,
         )
-        await execute(request, robot)
+    else:
+        request = OpenLidCreate(
+            params=OpenLidParams(moduleId=module.location.moduleId),
+            intent=CommandIntent.PROTOCOL,
+            key=None,
+        )
+    await execute(request, robot)
+
+
+async def set_thermocycler_lid_temperature(
+    *, at_slot: RobotDeckSlot, temperature_c: int | float, run: Run, robot: Robot
+) -> WaitForLidTemperatureResult:
+    module = at_slot.module
+    if not module:
+        raise HTTPException(400, f"Bay {at_slot.location} doesn't have a module")
 
     request = SetTargetLidTemperatureCreate(
         params=SetTargetLidTemperatureParams(
-            moduleId=module.moduleId,
+            moduleId=module.location.moduleId,
             celsius=float(temperature_c),
         ),
         intent=CommandIntent.PROTOCOL,
@@ -902,61 +1236,54 @@ async def set_thermocycler_lid(
 
     request = WaitForLidTemperatureCreate(
         params=WaitForLidTemperatureParams(
-            moduleId=module.moduleId,
+            moduleId=module.location.moduleId,
         ),
         intent=CommandIntent.PROTOCOL,
         key=None,
     )
-    response = cast(WaitForLidTemperatureResult, await execute(request, robot))
-
-    if not closed:
-        request = OpenLidCreate(
-            params=OpenLidParams(moduleId=module.moduleId),
-            intent=CommandIntent.PROTOCOL,
-            key=None,
-        )
-        await execute(request, robot)
-    return response
+    return cast(WaitForLidTemperatureResult, await execute(request, robot))
 
 
 async def deactivate_robot(run: Run, *, success: bool) -> None:
     robot = run.robot
 
-    pipette = run.pipettes[PIPETTE_1_CHANNEL]
-    if pipette.has_tip:
-        await drop_tip(run, robot)
+    await home(run, robot)  # if the robot is lost, must home prior to dropping
+    for pipette in run.pipettes.values():
+        if pipette.has_tip:
+            await drop_tip(None, None, pipette, robot)
 
-    temperature = run.deck["C1"].module
-    if not temperature:
-        raise HTTPException(400, f"Bay C1 doesn't have a temperature")
-    request = DeactivateTemperatureCreate(
-        params=DeactivateTemperatureParams(moduleId=temperature.moduleId),
-        intent=CommandIntent.PROTOCOL,
-        key=None,
-    )
-    await execute(request, robot)
+    for slot in run.deck.values():
+        if not slot.module:
+            continue
 
-    thermocycler = run.deck["B1"].module
-    if not thermocycler:
-        raise HTTPException(400, f"Bay B1 doesn't have a thermocycler")
-    request = DeactivateBlockCreate(
-        params=DeactivateBlockParams(moduleId=thermocycler.moduleId),
-        intent=CommandIntent.PROTOCOL,
-        key=None,
-    )
-    await execute(request, robot)
-    request = DeactivateLidCreate(
-        params=DeactivateLidParams(moduleId=thermocycler.moduleId),
-        intent=CommandIntent.PROTOCOL,
-        key=None,
-    )
-    await execute(request, robot)
-    request = OpenLidCreate(
-        params=OpenLidParams(moduleId=thermocycler.moduleId),
-        intent=CommandIntent.PROTOCOL,
-        key=None,
-    )
-    await execute(request, robot)
+        module = slot.module
+        if module.model == ModuleModel.TEMPERATURE_MODULE_V2:
+            request = DeactivateTemperatureCreate(
+                params=DeactivateTemperatureParams(moduleId=module.location.moduleId),
+                intent=CommandIntent.PROTOCOL,
+                key=None,
+            )
+            await execute(request, robot)
+        elif module.model == ModuleModel.THERMOCYCLER_MODULE_V2:
+            request = DeactivateBlockCreate(
+                params=DeactivateBlockParams(moduleId=module.location.moduleId),
+                intent=CommandIntent.PROTOCOL,
+                key=None,
+            )
+            await execute(request, robot)
+            request = DeactivateLidCreate(
+                params=DeactivateLidParams(moduleId=module.location.moduleId),
+                intent=CommandIntent.PROTOCOL,
+                key=None,
+            )
+            await execute(request, robot)
+            request = OpenLidCreate(
+                params=OpenLidParams(moduleId=module.location.moduleId),
+                intent=CommandIntent.PROTOCOL,
+                key=None,
+            )
+            await execute(request, robot)
+
     await home(run, robot)
 
     if success:
