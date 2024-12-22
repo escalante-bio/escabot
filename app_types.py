@@ -135,7 +135,6 @@ class Run:
     def create(id: str, robot: Robot) -> Run:
         deck = {}
         for slot in [
-            # Skip A1 because it's taken by the thermocycler
             "A1",
             "A2",
             "A3",
