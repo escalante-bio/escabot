@@ -42,7 +42,6 @@ class HomeRequest(BaseModel):
 
 class InitializeRequest(BaseModel):
     kind: Literal["initialize"]
-    tip_racks: list[str] = Field(alias="tipRacks")
 
 
 class LoadLabwareRequest(BaseModel):

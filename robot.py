@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+import os
 import types
 from typing import Literal, Optional, cast
 
@@ -200,15 +201,20 @@ from app_types import (
 )
 
 
+# See the default aspirate and dispense offsets at
+# https://github.com/Opentrons/opentrons/blob/aadc65ec79ebbf66acd9df08dcfb7910d34cdfb9/api/src/opentrons/protocol_api/instrument_context.py#L44
 # See the mapping at
 # https://github.com/Opentrons/opentrons/blob/aadc65ec79ebbf66acd9df08dcfb7910d34cdfb9/api/src/opentrons/protocol_api/validation.py#L63
 PIPETTE_1_CHANNEL = PipetteNameType.P50_SINGLE_FLEX
 PIPETTE_8_CHANNEL = PipetteNameType.P50_MULTI_FLEX
 WASTE_CHUTE_AREA = "96ChannelWasteChute"  # originally was 1Channel. Was that important?
 
-# See the default pipetting offset at
-# https://github.com/Opentrons/opentrons/blob/aadc65ec79ebbf66acd9df08dcfb7910d34cdfb9/api/src/opentrons/protocol_api/instrument_context.py#L44
 LABWARE_OFFSETS = {
+    "A2": WellOffset(x=-0.30000000000000004, y=0.7, z=0),
+    "A3": WellOffset(x=0.5, y=1.2, z=0),
+    "B1": WellOffset(x=0.9999999999999999, y=0.4, z=0),
+    "B2": WellOffset(x=0, y=0.8999999999999999, z=0),
+    "C1": WellOffset(x=0.6, y=0.7999999999999999, z=0),
 }
 
 
@@ -451,11 +457,7 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
             raise Exception(f"Run {run.id} has already been initialized")
 
         # We don't need to lock here because run.initialized basically is a lock
-
         await initialize_robot(run)
-        for tip_rack in instruction.tip_racks:
-            await load_labware("opentrons/opentrons_flex_96_tiprack_50ul/1", tip_rack, run, robot)
-
         run.initialized = True
         return
     elif not run.initialized:
@@ -680,7 +682,9 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
         )
         at_slot.lock.release()
     elif isinstance(instruction, WaitRequest):
-        await asyncio.sleep(instruction.duration_us / 1000 / 1000)
+        skip_waiting = os.environ.get("SKIP_WAITING", "false").lower() == "true"
+        if not skip_waiting:
+            await asyncio.sleep(instruction.duration_us / 1000 / 1000)
     else:
         raise HTTPException(400, f"Unknown command: {instruction}")
     logging.warning("Finished executing instruction %s", instruction)
@@ -721,7 +725,7 @@ async def aspirate(
     slot: RobotDeckSlot,
     well: str,
     volume_nl: int | float,
-    z: float,
+    z_mm: float,
     pipette: RobotPipette,
     run: Run,
     robot: Robot,
@@ -741,7 +745,7 @@ async def aspirate(
         offset = WellOffset()
     wellLocation = LiquidHandlingWellLocation(
         origin=WellOrigin.BOTTOM,
-        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z),
+        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z_mm),
     )
     aspirate = AspirateCreate(
         params=AspirateParams(
@@ -787,7 +791,7 @@ async def dispense(
     slot: RobotDeckSlot,
     well: str,
     volume_nl: int | float,
-    z: float,
+    z_mm: float,
     pipette: RobotPipette,
     run: Run,
     robot: Robot,
@@ -807,7 +811,7 @@ async def dispense(
         offset = WellOffset()
     well_location = LiquidHandlingWellLocation(
         origin=WellOrigin.BOTTOM,
-        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z),
+        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z_mm),
     )
     dispense = DispenseCreate(
         params=DispenseParams(
@@ -891,8 +895,13 @@ async def drop_tip(
                 forceDirect=False,
                 ignoreTipConfiguration=None,
                 minimumZHeight=None,
-                # Some bug in OT software means we need to set this to 20
-                offset=AddressableOffsetVector(x=0, y=0, z=20),
+                # Two bugs in OT (2025-01-09):
+                # 1) z=0 leads to tips being dragged through the trash chute
+                # 2) y=0 leads to crashing into the front of the robot when dropping 4 tips from the
+                #    8
+                # TODO(april): it's possible this is caused by WASTE_CHUTE_AREA being set for the 96
+                # well. Do we even need to call AddAddressableArea?
+                offset=AddressableOffsetVector(x=0, y=20, z=20),
                 speed=None,
             ),
             intent=CommandIntent.PROTOCOL,
