@@ -210,11 +210,6 @@ PIPETTE_8_CHANNEL = PipetteNameType.P50_MULTI_FLEX
 WASTE_CHUTE_AREA = "96ChannelWasteChute"  # originally was 1Channel. Was that important?
 
 LABWARE_OFFSETS = {
-    "A2": WellOffset(x=-0.30000000000000004, y=0.7, z=0),
-    "A3": WellOffset(x=0.5, y=1.2, z=0),
-    "B1": WellOffset(x=0.9999999999999999, y=0.4, z=0),
-    "B2": WellOffset(x=0, y=0.8999999999999999, z=0),
-    "C1": WellOffset(x=0.6, y=0.7999999999999999, z=0),
 }
 
 
