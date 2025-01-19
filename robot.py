@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass
 import os
 import types
-from typing import Literal, Optional, cast
+from typing import Literal, Never, Optional, cast
 
 from fastapi import HTTPException
 from opentrons.types import DeckSlotName, Mount, MountType
@@ -145,6 +145,7 @@ from opentrons.protocol_engine.resources import (
 from opentrons.protocol_engine.state.command_history import CommandEntry
 from opentrons.protocol_engine.state.state import StateStore
 from opentrons.protocol_engine import (
+    DropTipWellOrigin,
     WellLocation,
     WellOffset,
     WellOrigin,
@@ -186,7 +187,9 @@ from app_requests import (
     MoveToWellRequest,
     PickUpTipRequest,
     TemperatureBlockTemperatureRequest,
+    ThermocycleBlockDeactivateRequest,
     ThermocycleBlockTemperatureRequest,
+    ThermocycleLidDeactivateRequest,
     ThermocycleLidHingeRequest,
     ThermocycleLidTemperatureRequest,
     WaitRequest,
@@ -198,6 +201,7 @@ from app_types import (
     RobotHardware,
     RobotPipette,
     Run,
+    TipSource,
 )
 
 
@@ -280,6 +284,7 @@ async def create_state_store(hardware_api: HardwareControlAPI, config: Config) -
 
     command_history = state_store.commands._state.command_history
 
+    # Allow commands to run concurrently
     def set_command_running_concurrent(command: Command) -> None:
         prev_entry = command_history.get(command.id)
         assert prev_entry.command.status == CommandStatus.QUEUED
@@ -323,6 +328,42 @@ async def create_state_store(hardware_api: HardwareControlAPI, config: Config) -
     command_history.set_command_running = set_command_running_concurrent
     command_history.set_command_succeeded = set_command_succeeded_concurrent
     command_history.set_command_failed = set_command_failed_concurrent
+
+    geometry = state_store.geometry
+
+    # Allow reracking multichannel tips while in partial tip configuration
+    def get_unchecked_tip_drop_location(
+        pipette_id: str,
+        labware_id: str,
+        well_location: DropTipWellLocation,
+        partially_configured: bool = False,
+    ) -> WellLocation:
+        if well_location.origin != DropTipWellOrigin.DEFAULT:
+            return WellLocation(
+                origin=WellOrigin(well_location.origin.value),
+                offset=well_location.offset,
+            )
+
+        if geometry._labware.get_definition(labware_id).parameters.isTiprack:
+            z_offset = geometry._labware.get_tip_drop_z_offset(
+                labware_id=labware_id,
+                length_scale=geometry._pipettes.get_return_tip_scale(pipette_id),
+                additional_offset=well_location.offset.z,
+            )
+        else:
+            # return to top if labware is not tip rack
+            z_offset = well_location.offset.z
+
+        return WellLocation(
+            origin=WellOrigin.TOP,
+            offset=WellOffset(
+                x=well_location.offset.x,
+                y=well_location.offset.y,
+                z=z_offset,
+            ),
+        )
+
+    geometry.get_checked_tip_drop_location = get_unchecked_tip_drop_location
 
     # Opentrons people can resume looking past this point
 
@@ -632,6 +673,18 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
         await at_slot.lock.acquire()
         await set_temperature_block(at_slot, instruction.temperature_c, run, robot)
         at_slot.lock.release()
+    elif isinstance(instruction, ThermocycleBlockDeactivateRequest):
+        at_bay = instruction.at
+        at_slot = run.deck[at_bay]
+        if not at_slot:
+            raise HTTPException(400, f"Bay {at_bay} is invalid")
+        await at_slot.lock.acquire()
+        await deactivate_thermocycler_block(
+            at_slot=at_slot,
+            run=run,
+            robot=robot,
+        )
+        at_slot.lock.release()
     elif isinstance(instruction, ThermocycleBlockTemperatureRequest):
         at_bay = instruction.at
         at_slot = run.deck[at_bay]
@@ -643,6 +696,19 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
             duration_us=instruction.duration_us,
             max_volume_nl=instruction.max_volume_nl,
             temperature_c=instruction.temperature_c,
+            run=run,
+            robot=robot,
+        )
+        at_slot.lock.release()
+    elif isinstance(instruction, ThermocycleLidDeactivateRequest):
+        at_bay = instruction.at
+        at_slot = run.deck[at_bay]
+        if not at_slot:
+            raise HTTPException(400, f"Bay {at_bay} is invalid")
+
+        await at_slot.lock.acquire()
+        await deactivate_thermocycler_lid(
+            at_slot=at_slot,
             run=run,
             robot=robot,
         )
@@ -681,7 +747,11 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
         if not skip_waiting:
             await asyncio.sleep(instruction.duration_us / 1000 / 1000)
     else:
-        raise HTTPException(400, f"Unknown command: {instruction}")
+        # By typing this with Never we get a static exhaustive check too
+        def assert_unexpected(instruction: Never) -> Never:
+            raise HTTPException(400, f"Unknown command: {instruction}")
+
+        assert_unexpected(instruction)
     logging.warning("Finished executing instruction %s", instruction)
 
 
@@ -915,6 +985,7 @@ async def drop_tip(
         cast(DropTipInPlaceResult, await execute(drop, robot))
 
     pipette.has_tip = False
+    pipette.tip_source = None
 
 
 async def liquid_probe(
@@ -1015,6 +1086,7 @@ async def load_pipette(
         channels=channels,
         has_tip=False,
         max_volume_nl=max_volume_nl,
+        tip_source=None,
     )
     return result
 
@@ -1129,6 +1201,7 @@ async def pick_up_tip(
     )
     result = cast(PickUpTipResult, await execute(request, robot))
     pipette.has_tip = True
+    pipette.tip_source = TipSource(bay=slot, well=well)
     return result
 
 
@@ -1164,6 +1237,21 @@ async def set_temperature_block(
     return cast(WaitForTemperatureResult, await execute(request, robot))
 
 
+async def deactivate_thermocycler_block(
+    *, at_slot: RobotDeckSlot, run: Run, robot: Robot
+) -> None:
+    module = at_slot.module
+    if not module:
+        raise HTTPException(400, f"Bay {at_slot.location} doesn't have a module")
+
+    request = DeactivateBlockCreate(
+        params=DeactivateBlockParams(moduleId=module.location.moduleId),
+        intent=CommandIntent.PROTOCOL,
+        key=None,
+    )
+    await execute(request, robot)
+
+
 async def set_thermocycler_block(
     *,
     at_slot: RobotDeckSlot,
@@ -1197,6 +1285,21 @@ async def set_thermocycler_block(
         key=None,
     )
     return cast(WaitForBlockTemperatureResult, await execute(request, robot))
+
+
+async def deactivate_thermocycler_lid(
+    *, at_slot: RobotDeckSlot, run: Run, robot: Robot
+) -> None:
+    module = at_slot.module
+    if not module:
+        raise HTTPException(400, f"Bay {at_slot.location} doesn't have a module")
+
+    request = DeactivateLidCreate(
+        params=DeactivateLidParams(moduleId=module.location.moduleId),
+        intent=CommandIntent.PROTOCOL,
+        key=None,
+    )
+    await execute(request, robot)
 
 
 async def set_thermocycler_lid_hinge(
@@ -1254,7 +1357,12 @@ async def deactivate_robot(run: Run, *, success: bool) -> None:
     await home(run, robot)  # if the robot is lost, must home prior to dropping
     for pipette in run.pipettes.values():
         if pipette.has_tip:
-            await drop_tip(None, None, pipette, robot)
+            # TODO(april): this reracks into the source *clean* tiprack, which is janky. It might be
+            # better to just drop the tips somewhere on deck for analysis?
+            s = pipette.tip_source
+            await drop_tip(s.bay if s else None, s.well if s else None, pipette, robot)
+            pipette.has_tip = False
+            pipette.tip_source = None
 
     for slot in run.deck.values():
         if not slot.module:
@@ -1269,24 +1377,9 @@ async def deactivate_robot(run: Run, *, success: bool) -> None:
             )
             await execute(request, robot)
         elif module.model == ModuleModel.THERMOCYCLER_MODULE_V2:
-            request = DeactivateBlockCreate(
-                params=DeactivateBlockParams(moduleId=module.location.moduleId),
-                intent=CommandIntent.PROTOCOL,
-                key=None,
-            )
-            await execute(request, robot)
-            request = DeactivateLidCreate(
-                params=DeactivateLidParams(moduleId=module.location.moduleId),
-                intent=CommandIntent.PROTOCOL,
-                key=None,
-            )
-            await execute(request, robot)
-            request = OpenLidCreate(
-                params=OpenLidParams(moduleId=module.location.moduleId),
-                intent=CommandIntent.PROTOCOL,
-                key=None,
-            )
-            await execute(request, robot)
+            await deactivate_thermocycler_block(at_slot=slot, run=run, robot=robot)
+            await deactivate_thermocycler_lid(at_slot=slot, run=run, robot=robot)
+            await set_thermocycler_lid_hinge(at_slot=slot, closed=False, run=run, robot=robot)
 
     await home(run, robot)
 

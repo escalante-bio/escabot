@@ -115,11 +115,18 @@ class RobotHardware:
 
 
 @dataclass(kw_only=True)
+class TipSource:
+    bay: RobotDeckSlot
+    well: str
+
+
+@dataclass(kw_only=True)
 class RobotPipette:
     pipette: LoadPipetteResult
     channels: int
     has_tip: bool
     max_volume_nl: float
+    tip_source: TipSource | None
 
 
 @dataclass(frozen=True, kw_only=True)

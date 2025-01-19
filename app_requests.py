@@ -86,12 +86,22 @@ class TemperatureBlockTemperatureRequest(BaseModel):
     temperature_c: float = Field(alias="temperatureC")
 
 
+class ThermocycleBlockDeactivateRequest(BaseModel):
+    kind: Literal["thermocycle_block_deactivate"]
+    at: str
+
+
 class ThermocycleBlockTemperatureRequest(BaseModel):
     kind: Literal["thermocycle_block_temperature"]
     at: str
     duration_us: Optional[float] = Field(alias="durationUs")
     max_volume_nl: float = Field(alias="maxVolumeNl")
     temperature_c: float = Field(alias="temperatureC")
+
+
+class ThermocycleLidDeactivateRequest(BaseModel):
+    kind: Literal["thermocycle_lid_deactivate"]
+    at: str
 
 
 class ThermocycleLidHingeRequest(BaseModel):
@@ -124,7 +134,9 @@ InstructionRequest = (
     | MoveToWellRequest
     | PickUpTipRequest
     | TemperatureBlockTemperatureRequest
+    | ThermocycleBlockDeactivateRequest
     | ThermocycleBlockTemperatureRequest
+    | ThermocycleLidDeactivateRequest
     | ThermocycleLidHingeRequest
     | ThermocycleLidTemperatureRequest
     | WaitRequest
