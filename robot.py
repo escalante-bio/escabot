@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass
 import os
 import types
-from typing import Literal, Never, Optional, cast
+from typing import Literal, NoReturn, Optional, cast
 
 from fastapi import HTTPException
 from opentrons.types import DeckSlotName, Mount, MountType
@@ -748,7 +748,7 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
             await asyncio.sleep(instruction.duration_us / 1000 / 1000)
     else:
         # By typing this with Never we get a static exhaustive check too
-        def assert_unexpected(instruction: Never) -> Never:
+        def assert_unexpected(instruction: NoReturn) -> NoReturn:
             raise HTTPException(400, f"Unknown command: {instruction}")
 
         assert_unexpected(instruction)
