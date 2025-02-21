@@ -9,6 +9,12 @@ class WellLocationRequest(BaseModel):
     well: str
 
 
+class WellOffsetRequest(BaseModel):
+    x_mm: float = Field(alias="xMm")
+    y_mm: float = Field(alias="yMm")
+    z_mm: float = Field(alias="zMm")
+
+
 class AddLabwareDefinitionRequest(BaseModel):
     kind: Literal["add_labware_definition"]
     definition: dict
@@ -18,16 +24,16 @@ class AspirateRequest(BaseModel):
     kind: Literal["aspirate"]
     at: WellLocationRequest
     channels: int
+    offset: WellOffsetRequest
     volume_nl: float = Field(alias="volumeNl")
-    z_mm: float = Field(alias="zMm")
 
 
 class DispenseRequest(BaseModel):
     kind: Literal["dispense"]
     at: WellLocationRequest
     channels: int
+    offset: WellOffsetRequest
     volume_nl: float = Field(alias="volumeNl")
-    z_mm: float = Field(alias="zMm")
 
 
 class DropTipRequest(BaseModel):

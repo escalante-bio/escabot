@@ -52,9 +52,9 @@ from opentrons.protocol_engine.commands import (
     HomeCreate,
     HomeParams,
     HomeResult,
-    LiquidProbeCreate,
-    LiquidProbeParams,
-    LiquidProbeResult,
+    TryLiquidProbeCreate,
+    TryLiquidProbeParams,
+    TryLiquidProbeResult,
     LoadLabwareCreate,
     LoadLabwareParams,
     LoadLabwareResult,
@@ -193,6 +193,7 @@ from app_requests import (
     ThermocycleLidHingeRequest,
     ThermocycleLidTemperatureRequest,
     WaitRequest,
+    WellOffsetRequest,
 )
 from app_types import (
     Robot,
@@ -212,9 +213,6 @@ from app_types import (
 PIPETTE_1_CHANNEL = PipetteNameType.P50_SINGLE_FLEX
 PIPETTE_8_CHANNEL = PipetteNameType.P50_MULTI_FLEX
 WASTE_CHUTE_AREA = "96ChannelWasteChute"  # originally was 1Channel. Was that important?
-
-LABWARE_OFFSETS = {
-}
 
 
 async def create_hardware_control(simulate_hardware: bool) -> HardwareControlAPI:
@@ -545,7 +543,7 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
             slot,
             instruction.at.well,
             volume_nl,
-            instruction.z_mm,
+            instruction.offset,
             pipette,
             run,
             robot,
@@ -577,7 +575,8 @@ async def execute_instruction(instruction: InstructionRequest, run: Run):
                     f"{pipette.max_volume_nl}nl"
                 ),
             )
-        await dispense(slot, instruction.at.well, volume_nl, instruction.z_mm, pipette, run, robot)
+        await dispense(
+          slot, instruction.at.well, volume_nl, instruction.offset, pipette, run, robot)
         run.gantry_lock.release()
         slot.lock.release()
     elif isinstance(instruction, HomeRequest):
@@ -790,7 +789,7 @@ async def aspirate(
     slot: RobotDeckSlot,
     well: str,
     volume_nl: int | float,
-    z_mm: float,
+    offset: WellOffsetRequest,
     pipette: RobotPipette,
     run: Run,
     robot: Robot,
@@ -804,13 +803,9 @@ async def aspirate(
         # We can still try to move the temperature adapter... oops
         raise Exception(f"Expected labware to be on top")
 
-    if isinstance(slot.location, DeckSlotLocation):
-        offset = LABWARE_OFFSETS.get(slot.location.slotName.value) or WellOffset()
-    else:
-        offset = WellOffset()
     wellLocation = LiquidHandlingWellLocation(
         origin=WellOrigin.BOTTOM,
-        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z_mm),
+        offset=WellOffset(x=offset.x_mm, y=offset.y_mm, z=offset.z_mm),
     )
     aspirate = AspirateCreate(
         params=AspirateParams(
@@ -856,7 +851,7 @@ async def dispense(
     slot: RobotDeckSlot,
     well: str,
     volume_nl: int | float,
-    z_mm: float,
+    offset: WellOffsetRequest,
     pipette: RobotPipette,
     run: Run,
     robot: Robot,
@@ -870,13 +865,9 @@ async def dispense(
         # We can still try to move the temperature adapter... oops
         raise Exception(f"Expected labware to be on top")
 
-    if isinstance(slot.location, DeckSlotLocation):
-        offset = LABWARE_OFFSETS.get(slot.location.slotName.value, WellOffset())
-    else:
-        offset = WellOffset()
     well_location = LiquidHandlingWellLocation(
         origin=WellOrigin.BOTTOM,
-        offset=WellOffset(x=offset.x, y=offset.y, z=offset.z + z_mm),
+        offset=WellOffset(x=offset.x_mm, y=offset.y_mm, z=offset.z_mm),
     )
     dispense = DispenseCreate(
         params=DispenseParams(
@@ -950,6 +941,10 @@ async def drop_tip(
             intent=CommandIntent.PROTOCOL,
             key=None,
         )
+        # We don't interrupt tip drops but we may interrupt AFTER the drop, so we need to do this
+        # first
+        pipette.has_tip = False
+        pipette.tip_source = None
         cast(DropTipResult, await execute(drop, robot))
     else:
         move = MoveToAddressableAreaForDropTipCreate(
@@ -982,42 +977,39 @@ async def drop_tip(
             intent=CommandIntent.PROTOCOL,
             key=None,
         )
+        pipette.has_tip = False
+        pipette.tip_source = None
         cast(DropTipInPlaceResult, await execute(drop, robot))
 
-    pipette.has_tip = False
-    pipette.tip_source = None
 
 
 async def liquid_probe(
     slot: RobotDeckSlot,
     well: str,
+    offset: WellOffsetRequest,
     pipette: RobotPipette,
     run: Run,
     robot: Robot,
-) -> LiquidProbeResult:
+) -> TryLiquidProbeResult:
     top = slot.stack[-1]
     if not isinstance(top, OnLabwareLocation):
         # We can still try to move the temperature adapter... oops
         raise Exception(f"Expected labware to be on top")
 
-    if isinstance(slot.location, DeckSlotLocation):
-        offset = LABWARE_OFFSETS.get(slot.location.slotName.value) or WellOffset()
-    else:
-        offset = WellOffset()
-    request = LiquidProbeCreate(
-        params=LiquidProbeParams(
+    request = TryLiquidProbeCreate(
+        params=TryLiquidProbeParams(
             pipetteId=pipette.pipette.pipetteId,
             labwareId=top.labwareId,
             wellName=well,
             wellLocation=WellLocation(
                 origin=WellOrigin.TOP,
-                offset=WellOffset(x=offset.x, y=offset.y, z=0),
+                offset=WellOffset(x=offset.x_mm, y=offset.y_mm, z=offset.z_mm),
             ),
         ),
         intent=CommandIntent.PROTOCOL,
         key=None,
     )
-    return cast(LiquidProbeResult, await execute(request, robot))
+    return cast(TryLiquidProbeResult, await execute(request, robot))
 
 
 async def load_labware(model: str, location: str, run: Run, robot: Robot) -> OnLabwareLocation:
