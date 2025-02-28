@@ -21,6 +21,7 @@ from opentrons.protocol_engine import (
     Config,
     DeckType,
     DropTipWellLocation,
+    QuadrantNozzleLayoutConfiguration,
     SingleNozzleLayoutConfiguration,
 )
 from opentrons.protocol_engine.actions import (
@@ -362,6 +363,33 @@ async def create_state_store(hardware_api: HardwareControlAPI, config: Config) -
         )
 
     geometry.get_checked_tip_drop_location = get_unchecked_tip_drop_location
+
+    # Add A1toB1 etc for 8-channel pipettes by mirroing H1toG1 etc, and allow LLD down to 0mm
+
+    from opentrons_shared_data.pipette.pipette_definition import PipetteConfigurations
+
+    original_model_validate = PipetteConfigurations.model_validate
+
+    def evil_model_validate(obj, *args, **kwargs):
+        valid_maps = obj["validNozzleMaps"]["maps"]
+        configurations = obj["pickUpTipConfigurations"]["pressFit"]["configurationsByNozzleMap"]
+        if obj["channels"] == 8:
+            full = configurations["Full"]
+            for start, ends in (
+                ("A1", ["B1", "C1", "D1", "E1", "F1", "G1"]),
+                ("H1", ["G1", "F1", "E1", "D1", "C1", "B1"]),
+            ):
+              for i, end in enumerate(ends):
+                  key = f"{start}to{end}"
+                  configurations[key] = full
+                  valid_maps[key] = [start] + ends[:i + 1]
+        if lld := obj.get("lldSettings"):
+            for v in lld.values():
+                v["minHeight"] = 0.0
+
+        return original_model_validate(obj, *args, **kwargs)
+
+    PipetteConfigurations.model_validate = evil_model_validate
 
     # Opentrons people can resume looking past this point
 
@@ -769,7 +797,11 @@ async def get_pipette(
             configurationParams=(
                 AllNozzleLayoutConfiguration()
                 if channels in [1, 8]
-                else SingleNozzleLayoutConfiguration(primaryNozzle="A1")
+                else QuadrantNozzleLayoutConfiguration(
+                    primaryNozzle="A1",
+                    frontRightNozzle=["B1", "C1", "D1", "E1", "F1", "G1"][channels - 2],
+                    backLeftNozzle="A1",
+                )
             ),
         ),
         intent=CommandIntent.PROTOCOL,
@@ -1086,7 +1118,7 @@ async def load_pipette(
 async def load_waste_chute(run: Run, robot: Robot) -> None:
     robot.action_dispatcher.dispatch(
         AddAddressableAreaAction(
-            addressable_area=AddressableAreaLocation(addressableAreaName=WASTE_CHUTE_AREA),
+            addressable_area_name=WASTE_CHUTE_AREA,
         )
     )
 
@@ -1100,6 +1132,10 @@ async def move_labware(
     pickUpOffset: LabwareOffsetVector | None = None,
     dropOffset: LabwareOffsetVector | None = None,
 ) -> MoveLabwareResult:
+    # Wasn't needed before 8.3.0, idk what changed
+    # https://github.com/Opentrons/opentrons/blob/ba74babda6cf26aa4d37bf4be3fab70689eecd7b/api/src/opentrons/hardware_control/instruments/ot3/gripper_handler.py#L134
+    await home(run, robot)  # why do I need to specify this? idk
+
     was = before.stack[-1]
     if not isinstance(was, OnLabwareLocation):
         # This doesn't stop us from trying to move the temperature adapter... oops

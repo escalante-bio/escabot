@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field, root_validator
 from opentrons.protocol_engine import WellOffset
@@ -39,7 +39,7 @@ class DispenseRequest(BaseModel):
 class DropTipRequest(BaseModel):
     kind: Literal["drop_tip"]
     channels: int
-    well: WellLocationRequest | None
+    well: WellLocationRequest | None = None
 
 
 class HomeRequest(BaseModel):
@@ -59,7 +59,7 @@ class LoadLabwareRequest(BaseModel):
 class LoadModuleRequest(BaseModel):
     kind: Literal["load_module"]
     into: str
-    module: Literal["magnetic"] | Literal["temperature"] | Literal["thermocycling"] | None
+    module: Literal["magnetic"] | Literal["temperature"] | Literal["thermocycling"] | None = None
 
 
 class MoveLabwareRequest(BaseModel):
@@ -71,6 +71,7 @@ class MoveLabwareRequest(BaseModel):
     @root_validator(pre=True)
     def alias_values(values):
         values["from_"] = values.pop("from")
+        return values
 
 
 class MoveToWellRequest(BaseModel):
@@ -100,7 +101,7 @@ class ThermocycleBlockDeactivateRequest(BaseModel):
 class ThermocycleBlockTemperatureRequest(BaseModel):
     kind: Literal["thermocycle_block_temperature"]
     at: str
-    duration_us: Optional[float] = Field(alias="durationUs")
+    duration_us: float | None = Field(alias="durationUs", default=None)
     max_volume_nl: float = Field(alias="maxVolumeNl")
     temperature_c: float = Field(alias="temperatureC")
 

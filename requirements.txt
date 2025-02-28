@@ -1,3 +1,4 @@
-fastapi[standard]==0.115.6
-opentrons==8.2.0
-python-can==4.5.0
+fastapi[standard]==0.115.8
+opentrons==8.3.0
+pydantic==2.9.0
+python-can==4.5.0 # on flex this is actually 4.2.2 but whatever
